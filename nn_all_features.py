@@ -5,13 +5,6 @@ import multiprocessing as mp
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from utils import (
-    get_shadow_ratio,
-    get_log_range_with_body_strength,
-    get_closing_strength,
-    get_normalized_close_position,
-    get_kdj,
-)
 
 
 class OlsModel:
@@ -152,37 +145,41 @@ class OlsModel:
         windows_1d = 4 * 24
         windows_7d = windows_1d * 7
 
+        # 基础收益与波动率特征
         ret_15min = df_vwap / df_vwap.shift(1) - 1
         ret_1d = df_vwap / df_vwap.shift(windows_1d) - 1
         ret_7d = df_vwap / df_vwap.shift(windows_7d) - 1
         vol_1d = ret_15min.rolling(windows_1d).std()
         vol_7d = ret_15min.rolling(windows_7d).std()
         trend_diff = ret_1d - ret_7d
-        price_range_ratio = (df_high - df_low) / df_close
-        candle_body_ratio = (df_close - df_open) / (df_high - df_low + 1e-6)
+
+        # 形态特征
+        intraday_range = df_high - df_low
+        norm_close_pos = (df_close - df_low) / (intraday_range + 1e-6)
+        closing_strength = (df_close - df_open).abs() / (intraday_range + 1e-6)
+        logrange_body_strength = (
+            np.log(df_high / df_low + 1e-6) * (df_close - df_open).abs()
+        )
+
+        upper_shadow = df_high - df_open.combine(df_close, func=max)
+        lower_shadow = df_open.combine(df_close, func=min) - df_low
+        body = (df_close - df_open).abs()
+        shadow_ratio = (upper_shadow + lower_shadow) / (body + 1e-6)
+
+        # KDJ 动量指标
+        low_n = df_low.rolling(windows_7d).min()
+        high_n = df_high.rolling(windows_7d).max()
+        k_val = 100 * (df_close - low_n) / (high_n - low_n + 1e-6)
+        d_val = k_val.rolling(3).mean()
+
+        # 量能相关
+        price_range_ratio = intraday_range / df_close
+        candle_body_ratio = (df_close - df_open) / (intraday_range + 1e-6)
         vwap_deviation = (df_vwap - df_close) / df_close
         log_amount_diff = np.log1p(df_amount) - np.log1p(df_amount.shift(windows_1d))
+
+        # 目标值：未来一天收益
         target = ret_1d.shift(-windows_1d)
-
-        # 新增特征
-        shadow_ratio = get_shadow_ratio(df_high, df_low, df_open, df_close)
-        log_range_strength = get_log_range_with_body_strength(
-            df_close, df_open, df_high, df_low
-        )
-        closing_strength = get_closing_strength(df_close, df_open, df_high, df_low)
-        normalized_close_pos = get_normalized_close_position(df_close, df_high, df_low)
-
-        kdj_df = get_kdj(
-            pd.DataFrame(
-                {
-                    "High": df_high.stack(),
-                    "Low": df_low.stack(),
-                    "Close": df_close.stack(),
-                }
-            ).unstack(),
-            n=9,
-            m=3,
-        )
 
         features = {
             "ret_1d": ret_1d,
@@ -194,12 +191,13 @@ class OlsModel:
             "candle_body_ratio": candle_body_ratio,
             "vwap_dev": vwap_deviation,
             "log_amount_diff": log_amount_diff,
-            "shadow_ratio": shadow_ratio,
-            "log_range_strength": log_range_strength,
+            "intraday_range": intraday_range,
+            "norm_close_pos": norm_close_pos,
             "closing_strength": closing_strength,
-            "normalized_close_pos": normalized_close_pos,
-            "%K": kdj_df["%K"],
-            "%D": kdj_df["%D"],
+            "logrange_body_strength": logrange_body_strength,
+            "shadow_ratio": shadow_ratio,
+            "kdj_k": k_val,
+            "kdj_d": d_val,
         }
 
         df_list = [f.stack().rename(k) for k, f in features.items()]
