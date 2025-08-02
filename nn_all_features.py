@@ -161,8 +161,8 @@ class OlsModel:
             np.log(df_high / df_low + 1e-6) * (df_close - df_open).abs()
         )
 
-        upper_shadow = df_high - df_open.combine(df_close, func=max)
-        lower_shadow = df_open.combine(df_close, func=min) - df_low
+        upper_shadow = df_high - np.maximum(df_open, df_close)
+        lower_shadow = np.minimum(df_open, df_close) - df_low
         body = (df_close - df_open).abs()
         shadow_ratio = (upper_shadow + lower_shadow) / (body + 1e-6)
 
