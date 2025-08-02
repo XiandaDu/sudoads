@@ -2,10 +2,16 @@ import numpy as np
 import pandas as pd
 import datetime, os, time
 import multiprocessing as mp
-from pytorch_tabnet.tab_model import TabNetRegressor
+from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-import torch
+from sklearn.pipeline import Pipeline
+from utils import (
+    get_shadow_ratio,
+    get_log_range_with_body_strength,
+    get_closing_strength,
+    get_normalized_close_position,
+    get_kdj,
+)
 
 
 class OlsModel:
@@ -158,6 +164,26 @@ class OlsModel:
         log_amount_diff = np.log1p(df_amount) - np.log1p(df_amount.shift(windows_1d))
         target = ret_1d.shift(-windows_1d)
 
+        # 新增特征
+        shadow_ratio = get_shadow_ratio(df_high, df_low, df_open, df_close)
+        log_range_strength = get_log_range_with_body_strength(
+            df_close, df_open, df_high, df_low
+        )
+        closing_strength = get_closing_strength(df_close, df_open, df_high, df_low)
+        normalized_close_pos = get_normalized_close_position(df_close, df_high, df_low)
+
+        kdj_df = get_kdj(
+            pd.DataFrame(
+                {
+                    "High": df_high.stack(),
+                    "Low": df_low.stack(),
+                    "Close": df_close.stack(),
+                }
+            ).unstack(),
+            n=9,
+            m=3,
+        )
+
         features = {
             "ret_1d": ret_1d,
             "ret_7d": ret_7d,
@@ -168,43 +194,40 @@ class OlsModel:
             "candle_body_ratio": candle_body_ratio,
             "vwap_dev": vwap_deviation,
             "log_amount_diff": log_amount_diff,
+            "shadow_ratio": shadow_ratio,
+            "log_range_strength": log_range_strength,
+            "closing_strength": closing_strength,
+            "normalized_close_pos": normalized_close_pos,
+            "%K": kdj_df["%K"],
+            "%D": kdj_df["%D"],
         }
 
         df_list = [f.stack().rename(k) for k, f in features.items()]
         df_all = pd.concat(df_list + [target.stack().rename("target")], axis=1).dropna()
-        X = df_all[df_all.columns.difference(["target"])].values
-        y = df_all["target"].values.reshape(-1, 1)
+        X = df_all[df_all.columns.difference(["target"])]
+        y = df_all["target"]
 
-        X_train, X_valid, y_train, y_valid = train_test_split(
-            X, y, test_size=0.2, random_state=42
+        model = Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                (
+                    "mlp",
+                    MLPRegressor(
+                        hidden_layer_sizes=(256, 128, 64),
+                        activation="relu",
+                        solver="adam",
+                        max_iter=500,
+                        early_stopping=True,
+                        n_iter_no_change=10,
+                        random_state=42,
+                        learning_rate_init=0.001,
+                        verbose=True,
+                    ),
+                ),
+            ]
         )
-
-        model = TabNetRegressor(
-            n_d=32,
-            n_a=32,
-            n_steps=5,
-            gamma=1.5,
-            lambda_sparse=1e-3,
-            optimizer_fn=torch.optim.Adam,
-            optimizer_params=dict(lr=2e-3),
-            seed=42,
-            verbose=0,
-        )
-
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_valid, y_valid)],
-            eval_metric=["rmse"],
-            max_epochs=200,
-            patience=10,
-            batch_size=1024,
-            virtual_batch_size=128,
-            num_workers=0,
-            drop_last=False,
-        )
-
-        df_all["y_pred"] = model.predict(X).squeeze()
+        model.fit(X, y)
+        df_all["y_pred"] = model.predict(X)
 
         df_submit = df_all.reset_index().rename(
             columns={"level_0": "datetime", "level_1": "symbol"}
