@@ -140,15 +140,17 @@ class OlsModel:
         return cov / np.sqrt(var_true * var_pred)
 
     def train(self, df_target, df_factor1, df_factor2, df_factor3):
+        # 目标转长表
         target_long = df_target.stack()
         target_long.name = "target"
 
-        # 构造 DataFrame，只包含 target，预测值直接等于目标值
+        # 预测=目标（baseline）
         data = pd.DataFrame(target_long)
         data["y_pred"] = data["target"]
         data = data.dropna()
 
-        # 保存用于提交的预测结果
+        # ===== 生成提交文件（以 submission_id 为准）=====
+        # 先做出 (datetime, symbol) -> id 的预测表
         df_submit = data.reset_index(level=0)
         df_submit = df_submit[["level_0", "y_pred"]]
         df_submit["symbol"] = df_submit.index.values
@@ -158,19 +160,26 @@ class OlsModel:
         df_submit["id"] = df_submit["datetime"].astype(str) + "_" + df_submit["symbol"]
         df_submit = df_submit[["id", "predict_return"]]
 
-        print(df_submit)
-
-        df_submission_id = pd.read_csv("./result/submission_id.csv")
-        id_list = df_submission_id["id"].tolist()
-        df_submit_competion = df_submit[df_submit["id"].isin(id_list)]
-        missing_elements = list(set(id_list) - set(df_submit_competion["id"]))
-        new_rows = pd.DataFrame(
-            {"id": missing_elements, "predict_return": [0] * len(missing_elements)}
+        # 读入 submission_id，并严格对齐（只保留存在于 submission_id 的 id，且顺序一致）
+        df_submission_id = pd.read_csv("./result/submission_id.csv")  # 必须包含列 'id'
+        # 用左连接保证 submit.csv 行数与 submission_id 完全一致
+        df_submit_final = df_submission_id[["id"]].merge(df_submit, on="id", how="left")
+        # 缺失的预测值补 0
+        df_submit_final["predict_return"] = df_submit_final["predict_return"].fillna(
+            0.0
         )
-        df_submit_competion = pd.concat([df_submit, new_rows], ignore_index=True)
-        print(df_submit_competion.shape)
-        df_submit_competion.to_csv("./result/submit.csv", index=False)
 
+        print("submit file preview:", len(df_submit_final), "rows")
+        print("Expected column length:", len(df_submission_id))
+        # 可选健壮性检查：行数必须一致
+        assert len(df_submit_final) == len(
+            df_submission_id
+        ), "submit 行数与 submission_id 不一致！"
+
+        # 保存提交文件
+        df_submit_final.to_csv("./result/submit.csv", index=False)
+
+        # ===== 生成校验文件（不影响 submit 逻辑）=====
         df_check = data.reset_index(level=0)
         df_check = df_check[["level_0", "target"]]
         df_check["symbol"] = df_check.index.values
@@ -179,12 +188,9 @@ class OlsModel:
         df_check = df_check[df_check["datetime"] >= self.start_datetime]
         df_check["id"] = df_check["datetime"].astype(str) + "_" + df_check["symbol"]
         df_check = df_check[["id", "true_return"]]
-
-        print(df_check)
-
         df_check.to_csv("./result/check.csv", index=False)
 
-        # 计算 sanity check 的 weighted Spearman 相关系数（应为 1.0）
+        # sanity check：weighted Spearman（baseline 应为 1.0）
         rho_overall = self.weighted_spearmanr(data["target"], data["y_pred"])
         print(f"Weighted Spearman correlation coefficient: {rho_overall:.4f}")
 

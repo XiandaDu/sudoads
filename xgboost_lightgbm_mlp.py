@@ -140,368 +140,267 @@ class OlsModel:
         return cov / np.sqrt(var_true * var_pred)
 
     def train(self, df_vwap, df_open, df_high, df_low, df_close, df_amount):
-        import warnings, gc, math, time
+        """
+        两模融合（LightGBM + XGBoost），仅修改 train 函数内容。
+        - 特征：在原 XGBoost 版本的基础上，融合了 V7 中效果好的波动/价差/效率/位置类特征（做了简化，避免过重）。
+        - 训练：只用部分币种训练（默认 35%），降低内存占用；预测时分批遍历全部币种。
+        - 后处理：分位数裁剪 + 轻微波动归一，避免极端值（利于加权Spearman）。
+        - 输出：./result/submit.csv（严格匹配 submission_id.csv，缺失补0），./result/check.csv
+        """
+        import os, gc, warnings
 
         warnings.filterwarnings("ignore")
+        os.makedirs("./result", exist_ok=True)
 
-        # --- libs needed only inside train() to respect your "only change train/run" rule ---
         import numpy as np
         import pandas as pd
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.model_selection import TimeSeriesSplit
-        from xgboost import XGBRanker
+        from xgboost import XGBRegressor
         import lightgbm as lgb
-        import torch
-        import torch.nn as nn
-        from torch.utils.data import DataLoader, TensorDataset
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # ========= 通用设置 =========
+        dtype = np.float32
+        for _df in [df_vwap, df_open, df_high, df_low, df_close, df_amount]:
+            _df[:] = _df.astype(dtype)
 
-        # -----------------------
-        # 1) Features & target (kept from your original code, minimal edits)
-        # -----------------------
         windows_1d = 4 * 24
         windows_7d = windows_1d * 7
 
-        ret_15min = df_vwap / df_vwap.shift(1) - 1
-        ret_1d = df_vwap / df_vwap.shift(windows_1d) - 1
-        ret_7d = df_vwap / df_vwap.shift(windows_7d) - 1
-        vol_1d = ret_15min.rolling(windows_1d).std()
-        vol_7d = ret_15min.rolling(windows_7d).std()
-        trend_diff = ret_1d - ret_7d
-        price_range_ratio = (df_high - df_low) / df_close
-        candle_body_ratio = (df_close - df_open) / (df_high - df_low + 1e-6)
-        vwap_deviation = (df_vwap - df_close) / df_close
-        log_amount_diff = np.log1p(df_amount) - np.log1p(df_amount.shift(windows_1d))
-        target = ret_1d.shift(-windows_1d)
+        # ========= 仅用于评估的目标（未来24h收益，按PDF与样例代码定义） =========
+        ret_1d = df_vwap / df_vwap.shift(windows_1d) - 1.0
+        target_full = ret_1d.shift(-windows_1d).astype(dtype)
 
-        range_ = df_high - df_low
-        normalized_close = (df_close - df_low) / (range_ + 1e-6)
-        intraday_risk = ((range_) / df_close) ** 2
-        closing_strength = (df_close - df_open) / (range_ + 1e-6)
-        log_range_body_strength = np.log(df_high / df_low + 1e-6) * abs(
-            df_close - df_open
+        # ========= 内嵌特征函数（按币种子集计算，降低内存） =========
+        def compute_features_for(symbols):
+            vwap = df_vwap[symbols]
+            open_ = df_open[symbols]
+            high = df_high[symbols]
+            low = df_low[symbols]
+            close = df_close[symbols]
+            amount = df_amount[symbols]
+
+            # 基础收益/波动
+            ret15 = vwap.pct_change(1)
+            f_ret_1d = vwap.pct_change(windows_1d)
+            f_ret_7d = vwap.pct_change(windows_7d)
+            f_vol_1d = ret15.rolling(windows_1d, min_periods=windows_1d // 2).std()
+            f_vol_7d = ret15.rolling(windows_7d, min_periods=windows_7d // 2).std()
+
+            # 价差/形态
+            range_ = high - low
+            f_price_range_ratio = range_ / (close + 1e-6)
+            f_candle_body_ratio = (close - open_) / (range_ + 1e-6)
+            f_vwap_dev = (vwap - close) / (close + 1e-6)
+
+            # 来自 V7 的简化增强
+            # 高低价差的多窗口均值与波动（缩减窗口避免内存占用）
+            hl_spread = (high - low) / (vwap + 1e-6)
+            f_hl_mean_96 = hl_spread.rolling(96, min_periods=48).mean()
+            f_hl_std_96 = hl_spread.rolling(96, min_periods=48).std()
+            f_hl_mean_336 = hl_spread.rolling(336, min_periods=168).mean()
+            f_hl_std_336 = hl_spread.rolling(336, min_periods=168).std()
+
+            # 效率比（96）
+            net_change = (vwap - vwap.shift(96)).abs()
+            total_change = vwap.diff().abs().rolling(96, min_periods=48).sum()
+            f_eff_96 = net_change / (total_change + 1e-8)
+
+            # 价格位置（336）
+            hi_336 = high.rolling(336, min_periods=168).max()
+            lo_336 = low.rolling(336, min_periods=168).min()
+            f_pos_336 = (vwap - lo_336) / (hi_336 - lo_336 + 1e-8)
+
+            # 返回窗口（336）
+            f_ret_336 = vwap.pct_change(336)
+
+            # 量能（美元量均值，336）
+            volume_usd = amount * vwap
+            f_volusd_336 = volume_usd.rolling(336, min_periods=168).mean()
+
+            # RSI(96)
+            delta = vwap.diff()
+            gain = delta.clip(lower=0).rolling(96, min_periods=48).mean()
+            loss = (-delta.clip(upper=0)).rolling(96, min_periods=48).mean()
+            rs = gain / (loss + 1e-8)
+            f_rsi_96 = 100 - (100 / (1 + rs))
+
+            # Parkinson 波动(96)
+            f_parkinson_96 = np.sqrt(
+                ((np.log(high / low + 1e-8)) ** 2 / (4 * np.log(2)))
+                .rolling(96, min_periods=48)
+                .mean()
+            )
+
+            # 原脚本里的额外形态指标（轻量）
+            normalized_close = (close - low) / (range_ + 1e-6)
+            intraday_risk = (range_ / (close + 1e-6)) ** 2
+            closing_strength = (close - open_) / (range_ + 1e-6)
+
+            # 目标
+            y = target_full[symbols]
+
+            feats = {
+                "ret_1d": f_ret_1d,
+                "ret_7d": f_ret_7d,
+                "vol_1d": f_vol_1d,
+                "vol_7d": f_vol_7d,
+                "price_range_ratio": f_price_range_ratio,
+                "candle_body_ratio": f_candle_body_ratio,
+                "vwap_dev": f_vwap_dev,
+                "hl_mean_96": f_hl_mean_96,
+                "hl_std_96": f_hl_std_96,
+                "hl_mean_336": f_hl_mean_336,
+                "hl_std_336": f_hl_std_336,
+                "eff_96": f_eff_96,
+                "pos_336": f_pos_336,
+                "ret_336": f_ret_336,
+                "volusd_336": f_volusd_336,
+                "rsi_96": f_rsi_96,
+                "parkinson_96": f_parkinson_96,
+                "normalized_close": normalized_close,
+                "intraday_risk": intraday_risk,
+                "closing_strength": closing_strength,
+            }
+
+            return feats, y
+
+        # ========= 训练子集（默认取 35% 币种，固定随机种子，兼顾内存与泛化） =========
+        symbols = list(df_vwap.columns)
+        rng = np.random.RandomState(42)
+        train_symbols = sorted(
+            rng.choice(
+                symbols, size=max(1, int(len(symbols) * 0.35)), replace=False
+            ).tolist()
         )
 
-        upper_shadow = df_high - np.maximum(df_open, df_close)
-        lower_shadow = np.minimum(df_open, df_close) - df_low
-        shadow_ratio = (upper_shadow + lower_shadow) / (abs(df_close - df_open) + 1e-6)
+        feats_tr, y_tr_wide = compute_features_for(train_symbols)
 
-        lowest_low_14 = df_low.rolling(window=14).min()
-        highest_high_14 = df_high.rolling(window=14).max()
-        stochastic_k = (df_close - lowest_low_14) / (
-            highest_high_14 - lowest_low_14 + 1e-6
-        )
-        stochastic_d = stochastic_k.rolling(window=3).mean()
+        # 构造训练长表（只取训练币种，按时间×币种堆叠；在这里 dropna 避免不同窗口的 NaN）
+        feat_names = list(feats_tr.keys())
+        stacked_feats = [
+            feats_tr[n].stack().rename(n).astype(dtype) for n in feat_names
+        ]
+        y_tr = y_tr_wide.stack().rename("target").astype(dtype)
+        df_tr = pd.concat(stacked_feats + [y_tr], axis=1).dropna()
 
-        features = {
-            "ret_1d": ret_1d,
-            "ret_7d": ret_7d,
-            "vol_1d": vol_1d,
-            "vol_7d": vol_7d,
-            "trend_diff": trend_diff,
-            "price_range_ratio": price_range_ratio,
-            "candle_body_ratio": candle_body_ratio,
-            "vwap_dev": vwap_deviation,
-            "log_amount_diff": log_amount_diff,
-            "range": range_,
-            "normalized_close": normalized_close,
-            "intraday_risk": intraday_risk,
-            "closing_strength": closing_strength,
-            "log_range_body_strength": log_range_body_strength,
-            "shadow_ratio": shadow_ratio,
-            "stochastic_k": stochastic_k,
-            "stochastic_d": stochastic_d,
-        }
+        X_train = df_tr[feat_names].values.astype(dtype)
+        y_train = df_tr["target"].values.astype(dtype)
 
-        # Stack to long
-        df_list = [f.stack().rename(k) for k, f in features.items()]
-        df_all = pd.concat(df_list + [target.stack().rename("target")], axis=1).dropna()
+        # ========= 训练两模型 =========
+        n_jobs = max(1, os.cpu_count() - 2)
 
-        # Build groups by timestamp (cross-sectional rank per time)
-        ts_index = df_all.index.get_level_values(0)
-        group_sizes = pd.Series(ts_index).value_counts().sort_index()
-        # bring to aligned order with df_all
-        group_sizes = (
-            pd.Series(ts_index).groupby(ts_index).size().values
-        )  # in order of appearance
-
-        # Train/valid split by time (80/20)
-        unique_times = np.array(sorted(pd.Index(ts_index).unique()))
-        split_point = int(0.8 * len(unique_times))
-        train_times = set(unique_times[:split_point])
-        valid_times = set(unique_times[split_point:])
-
-        is_train = ts_index.isin(train_times)
-        is_valid = ts_index.isin(valid_times)
-
-        X_cols = df_all.columns.difference(["target"])
-        X = df_all[X_cols].astype(np.float32)
-        y = df_all["target"].astype(np.float32)
-
-        # Scale features (fit on train only)
-        scaler = StandardScaler()
-        X_train = pd.DataFrame(
-            scaler.fit_transform(X[is_train]), index=X[is_train].index, columns=X_cols
-        )
-        X_valid = pd.DataFrame(
-            scaler.transform(X[is_valid]), index=X[is_valid].index, columns=X_cols
-        )
-
-        y_train = y[is_train].values
-        y_valid = y[is_valid].values
-
-        # Build group arrays for XGB/LGB in train/valid
-        def groups_from_mask(mask):
-            times = ts_index[mask]
-            return pd.Series(times).groupby(times).size().values
-
-        group_train = groups_from_mask(is_train)
-        group_valid = groups_from_mask(is_valid)
-
-        # -----------------------
-        # 2) XGBoost Ranker
-        # -----------------------
-        xgb_ranker = XGBRanker(
+        # XGBoost：直方图算法，收缩学习率，适度树深，内存友好
+        xgb = XGBRegressor(
             n_estimators=400,
             max_depth=6,
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
-            tree_method="hist",
-            random_state=42,
+            reg_lambda=1.0,
             reg_alpha=0.0,
-            reg_lambda=1.0,
-            objective="rank:pairwise",
-            eval_metric="ndcg",
+            random_state=42,
+            tree_method="hist",
+            n_jobs=n_jobs,
+            verbosity=0,
         )
-        xgb_ranker.fit(
-            X_train.values,
-            y_train,
-            group=group_train,
-            eval_set=[(X_valid.values, y_valid)],
-            eval_group=[group_valid],
-            verbose=False,
+        xgb.fit(X_train, y_train)
+
+        # LightGBM：来源于V7的保守化参数（避免爆内存），并限制线程
+        lgbm = lgb.LGBMRegressor(
+            objective="regression",
+            num_leaves=163,
+            learning_rate=0.07,
+            feature_fraction=0.82,
+            bagging_fraction=0.70,
+            bagging_freq=2,
+            reg_alpha=0.71,
+            reg_lambda=0.09,
+            min_data_in_leaf=139,
+            max_depth=10,
+            n_estimators=350,
+            subsample_for_bin=200000,
+            n_jobs=n_jobs,
+            verbose=-1,
+            force_row_wise=True,
         )
-        xgb_pred_val = xgb_ranker.predict(X_valid.values)
+        lgbm.fit(X_train, y_train)
 
-        # -----------------------
-        # 3) LightGBM Ranker
-        # -----------------------
-        lgb_ranker = lgb.LGBMRanker(
-            n_estimators=500,
-            learning_rate=0.05,
-            num_leaves=127,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=1.0,
-            random_state=123,
-            objective="lambdarank",
-            metric="ndcg",
+        # ========= 可选：用时间切分的简单验证来确定融合权重 =========
+        try:
+            # 按时间分位切分（保证时序）
+            cutoff = df_tr.index.get_level_values(0).unique().quantile(0.8)
+            valid_idx = df_tr.index.get_level_values(0) >= cutoff
+            X_val = df_tr.loc[valid_idx, feat_names].values.astype(dtype)
+            y_val = df_tr.loc[valid_idx, "target"].values.astype(dtype)
+
+            p_xgb = xgb.predict(X_val).astype(dtype)
+            p_lgb = lgbm.predict(X_val).astype(dtype)
+
+            # 网格搜一个简单的线性融合系数，最大化加权Spearman
+            best_w, best_score = 0.6, -9.9
+            for w in [0.3, 0.4, 0.5, 0.6, 0.7]:
+                p_blend = w * p_lgb + (1 - w) * p_xgb
+                score = self.weighted_spearmanr(y_val, p_blend)
+                if score > best_score:
+                    best_w, best_score = w, score
+            w_lgb = best_w
+        except Exception:
+            # 回退：固定权重
+            w_lgb = 0.6
+        w_xgb = 1.0 - w_lgb
+
+        # ========= 全量预测：按币种分批堆叠，避免一次性爆内存 =========
+        results = []
+        chunk = 25  # 25~40 之间都可以；越小越省内存
+        for i in range(0, len(symbols), chunk):
+            syms = symbols[i : i + chunk]
+            feats_ck, y_ck_wide = compute_features_for(syms)
+
+            # 堆叠 & 对齐
+            stk = [feats_ck[n].stack().rename(n).astype(dtype) for n in feat_names]
+            y_ck = y_ck_wide.stack().rename("target").astype(dtype)
+            df_ck = pd.concat(stk + [y_ck], axis=1).dropna()
+
+            if len(df_ck) == 0:
+                continue
+
+            X_ck = df_ck[feat_names].values.astype(dtype)
+
+            # 双模预测 + 轻后处理
+            pred = w_lgb * lgbm.predict(X_ck).astype(dtype) + w_xgb * xgb.predict(
+                X_ck
+            ).astype(dtype)
+
+            # 分位数裁剪 + 目标波动缩放（~2%），抑制极端值
+            lo, hi = np.percentile(pred, 0.25), np.percentile(pred, 99.75)
+            pred = np.clip(pred, lo, hi).astype(dtype)
+            std = pred.std()
+            if std > 1e-8:
+                pred = (pred - pred.mean()) / std * dtype(0.02)
+
+            out = df_ck[["target"]].copy()
+            out["y_pred"] = pred
+            results.append(out)
+
+            del feats_ck, y_ck_wide, stk, df_ck, X_ck, pred
+            gc.collect()
+
+        if len(results) == 0:
+            raise RuntimeError(
+                "No valid rows to predict after feature generation. Check data ranges/NaNs."
+            )
+
+        results_df = pd.concat(results, axis=0)
+
+        # ========= 评估（In-sample） =========
+        rho = self.weighted_spearmanr(
+            results_df["target"].values, results_df["y_pred"].values
         )
-        lgb_ranker.fit(
-            X_train,
-            y_train,
-            group=group_train.tolist(),
-            eval_set=[(X_valid, y_valid)],
-            eval_group=[group_valid.tolist()],
-            verbose=False,
-        )
-        lgb_pred_val = lgb_ranker.predict(X_valid)
-
-        # -----------------------
-        # 4) MLP with Spearman-style correlation loss
-        #    We correlate predictions with z-scored ranks of the target *within each timestamp*.
-        # -----------------------
-        # prepare tensors for train/valid
-        def make_group_batches(Xdf, yvec, mask):
-            # returns batches where each batch = one timestamp group
-            tvals = ts_index[mask]
-            X_ = Xdf.values
-            y_ = yvec
-            # locate contiguous blocks by timestamp in Xdf.index (same order as mask)
-            times = Xdf.index.get_level_values(0).to_numpy()
-            # build indices for each group:
-            batches = []
-            start = 0
-            while start < len(times):
-                t0 = times[start]
-                end = start
-                while end < len(times) and times[end] == t0:
-                    end += 1
-                batches.append((start, end))
-                start = end
-            return X_, y_, batches
-
-        Xtr_np, ytr_np, tr_batches = make_group_batches(X_train, y_train, is_train)
-        Xva_np, yva_np, va_batches = make_group_batches(X_valid, y_valid, is_valid)
-
-        class MLP(nn.Module):
-            def __init__(self, d):
-                super().__init__()
-                self.net = nn.Sequential(
-                    nn.Linear(d, 256),
-                    nn.ReLU(),
-                    nn.Linear(256, 128),
-                    nn.ReLU(),
-                    nn.Linear(128, 1),
-                )
-
-            def forward(self, x):
-                return self.net(x).squeeze(-1)
-
-        def corr_loss(pred, target):
-            # pred/target are 1D tensors from a single timestamp group
-            pred = pred - pred.mean()
-            target = target - target.mean()
-            pred_std = pred.std(unbiased=False) + 1e-8
-            targ_std = target.std(unbiased=False) + 1e-8
-            corr = (pred * target).mean() / (pred_std * targ_std)
-            return 1.0 - corr  # maximize correlation -> minimize 1 - corr
-
-        # Precompute group-wise z-scored *ranks* for y (ranks are constants => no gradient issue)
-        def zrank_group(y_slice):
-            import scipy.stats as st
-
-            r = st.rankdata(y_slice)  # ascending; Spearman uses ranks of y
-            r = torch.tensor(r, dtype=torch.float32, device=device)
-            r = (r - r.mean()) / (r.std(unbiased=False) + 1e-8)
-            return r
-
-        mlp = MLP(X_train.shape[1]).to(device)
-        opt = torch.optim.Adam(mlp.parameters(), lr=1e-3)
-        mlp.train()
-        epochs = 10  # short & sweet; adjust if you want
-        for ep in range(epochs):
-            total = 0.0
-            for s, e in tr_batches:
-                x = torch.tensor(Xtr_np[s:e], dtype=torch.float32, device=device)
-                y_group = ytr_np[s:e]
-                y_rank = zrank_group(y_group)
-                opt.zero_grad()
-                pred = mlp(x)
-                loss = corr_loss(pred, y_rank)
-                loss.backward()
-                opt.step()
-                total += loss.item()
-            # optional tiny valid check
-            # print(f"MLP epoch {ep}: loss={total/len(tr_batches):.4f}")
-
-        mlp.eval()
-        with torch.no_grad():
-            mlp_pred_val = []
-            for s, e in va_batches:
-                x = torch.tensor(Xva_np[s:e], dtype=torch.float32, device=device)
-                mlp_pred_val.append(mlp(x).cpu().numpy())
-            mlp_pred_val = np.concatenate(mlp_pred_val, axis=0)
-
-        # -----------------------
-        # 5) Blend weights by maximizing Spearman on validation
-        # -----------------------
-        def spearman_weighted(y_true, y_pred):
-            # use your helper (weighted) if desired; plain Spearman per-sample also OK.
-            # Here we do weighted Spearman you defined elsewhere in this class:contentReference[oaicite:2]{index=2}.
-            return self.weighted_spearmanr(y_true, y_pred)
-
-        best_rho, best_w = -1.0, (0.0, 0.0, 1.0)
-        for w1 in np.linspace(0, 1, 11):
-            for w2 in np.linspace(0, 1 - w1, 11):
-                w3 = 1 - w1 - w2
-                pred = w1 * xgb_pred_val + w2 * lgb_pred_val + w3 * mlp_pred_val
-                rho = spearman_weighted(y_valid, pred)
-                if rho > best_rho:
-                    best_rho, best_w = rho, (w1, w2, w3)
-
         print(
-            f"Best blend on valid (weighted Spearman): {best_rho:.4f} with weights XGB={best_w[0]:.2f}, LGB={best_w[1]:.2f}, MLP={best_w[2]:.2f}"
+            f"Weighted Spearman correlation coefficient (blend w_lgb={w_lgb:.2f}, w_xgb={w_xgb:.2f}): {rho:.4f}"
         )
 
-        # -----------------------
-        # 6) Refit models on ALL data, then predict for submission
-        # -----------------------
-        X_all = pd.DataFrame(scaler.fit_transform(X), index=X.index, columns=X_cols)
-        y_all = y.values
-
-        # rebuild group sizes for ALL
-        group_all = (
-            pd.Series(X_all.index.get_level_values(0))
-            .groupby(lambda x: x)
-            .size()
-            .values
-        )
-
-        # Refit XGB/LGB on all
-        xgb_ranker_all = XGBRanker(
-            n_estimators=xgb_ranker.get_params()["n_estimators"],
-            max_depth=xgb_ranker.get_params()["max_depth"],
-            learning_rate=xgb_ranker.get_params()["learning_rate"],
-            subsample=xgb_ranker.get_params()["subsample"],
-            colsample_bytree=xgb_ranker.get_params()["colsample_bytree"],
-            tree_method="hist",
-            random_state=42,
-            reg_alpha=0.0,
-            reg_lambda=1.0,
-            objective="rank:pairwise",
-            eval_metric="ndcg",
-        )
-        xgb_ranker_all.fit(X_all.values, y_all, group=group_all, verbose=False)
-        lgb_ranker_all = lgb.LGBMRanker(
-            n_estimators=lgb_ranker.get_params()["n_estimators"],
-            learning_rate=lgb_ranker.get_params()["learning_rate"],
-            num_leaves=lgb_ranker.get_params()["num_leaves"],
-            subsample=lgb_ranker.get_params()["subsample"],
-            colsample_bytree=lgb_ranker.get_params()["colsample_bytree"],
-            reg_lambda=lgb_ranker.get_params()["reg_lambda"],
-            random_state=123,
-            objective="lambdarank",
-            metric="ndcg",
-        )
-        lgb_ranker_all.fit(X_all, y_all, group=group_all.tolist(), verbose=False)
-
-        # Refit MLP quickly on all (few epochs)
-        Xall_np = X_all.values
-        times_all = X_all.index.get_level_values(0).to_numpy()
-        # build groups for all
-        batches_all = []
-        start = 0
-        while start < len(times_all):
-            t0 = times_all[start]
-            end = start
-            while end < len(times_all) and times_all[end] == t0:
-                end += 1
-            batches_all.append((start, end))
-            start = end
-
-        mlp_all = MLP(X_all.shape[1]).to(device)
-        opt_all = torch.optim.Adam(mlp_all.parameters(), lr=1e-3)
-        mlp_all.train()
-        for ep in range(5):
-            for s, e in batches_all:
-                x = torch.tensor(Xall_np[s:e], dtype=torch.float32, device=device)
-                y_rank = zrank_group(y_all[s:e])
-                opt_all.zero_grad()
-                loss = corr_loss(mlp_all(x), y_rank)
-                loss.backward()
-                opt_all.step()
-        mlp_all.eval()
-
-        # Predictions on ALL rows
-        xgb_pred_all = xgb_ranker_all.predict(X_all.values)
-        lgb_pred_all = lgb_ranker_all.predict(X_all)
-        with torch.no_grad():
-            preds_all_mlp = []
-            for s, e in batches_all:
-                x = torch.tensor(Xall_np[s:e], dtype=torch.float32, device=device)
-                preds_all_mlp.append(mlp_all(x).cpu().numpy())
-            mlp_pred_all = np.concatenate(preds_all_mlp, axis=0)
-
-        w1, w2, w3 = best_w
-        df_all["y_pred"] = w1 * xgb_pred_all + w2 * lgb_pred_all + w3 * mlp_pred_all
-
-        # -----------------------
-        # 7) Submission + check + report Spearman
-        # -----------------------
-        df_submit = df_all.reset_index().rename(
+        # ========= 生成提交 =========
+        df_submit = results_df.reset_index().rename(
             columns={"level_0": "datetime", "level_1": "symbol"}
         )
         df_submit = df_submit[df_submit["datetime"] >= self.start_datetime]
@@ -510,19 +409,24 @@ class OlsModel:
             columns={"y_pred": "predict_return"}
         )
 
+        # 对齐 submission_id.csv，缺失补0
         df_submission_id = pd.read_csv("./result/submission_id.csv")
         id_list = df_submission_id["id"].tolist()
-        df_submit_comp = df_submit[df_submit["id"].isin(id_list)]
+
+        df_submit_comp = df_submit[df_submit["id"].isin(id_list)].copy()
         missing = list(set(id_list) - set(df_submit_comp["id"]))
         if missing:
             df_submit_comp = pd.concat(
                 [df_submit_comp, pd.DataFrame({"id": missing, "predict_return": 0.0})],
                 ignore_index=True,
             )
+
+        # 排序对齐
+        df_submit_comp = df_submit_comp.set_index("id").loc[id_list].reset_index()
         df_submit_comp.to_csv("./result/submit.csv", index=False)
 
-        # for offline check
-        df_check = df_all.reset_index().rename(
+        # 方便核对真值
+        df_check = results_df.reset_index().rename(
             columns={"level_0": "datetime", "level_1": "symbol"}
         )
         df_check = df_check[df_check["datetime"] >= self.start_datetime]
@@ -530,14 +434,10 @@ class OlsModel:
         df_check = df_check[["id", "target"]].rename(columns={"target": "true_return"})
         df_check.to_csv("./result/check.csv", index=False)
 
-        rho_w = self.weighted_spearmanr(df_all["target"], df_all["y_pred"])
-        print(f"Weighted Spearman correlation coefficient (ALL): {rho_w:.4f}")
-
-        # save for run() if needed
-        self._last_submit = df_submit_comp
-        self._last_rho = rho_w
-
     def run(self):
+        """
+        仅修改 run 函数内容：保持数据加载流程不变，转为 float32 以省内存，然后调用上面的融合训练。
+        """
         (
             all_symbol_list,
             time_arr,
@@ -549,16 +449,29 @@ class OlsModel:
             amount_arr,
         ) = self.get_all_symbol_kline()
 
-        df_vwap = pd.DataFrame(vwap_arr, columns=all_symbol_list, index=time_arr)
-        df_open = pd.DataFrame(open_price_arr, columns=all_symbol_list, index=time_arr)
-        df_high = pd.DataFrame(high_price_arr, columns=all_symbol_list, index=time_arr)
-        df_low = pd.DataFrame(low_price_arr, columns=all_symbol_list, index=time_arr)
-        df_close = pd.DataFrame(
-            close_price_arr, columns=all_symbol_list, index=time_arr
-        )
-        df_amount = pd.DataFrame(amount_arr, columns=all_symbol_list, index=time_arr)
+        import numpy as np
+        import pandas as pd
 
-        # Train + export
+        # 转 float32，减少一半内存占用
+        df_vwap = pd.DataFrame(
+            vwap_arr.astype(np.float32), columns=all_symbol_list, index=time_arr
+        )
+        df_open = pd.DataFrame(
+            open_price_arr.astype(np.float32), columns=all_symbol_list, index=time_arr
+        )
+        df_high = pd.DataFrame(
+            high_price_arr.astype(np.float32), columns=all_symbol_list, index=time_arr
+        )
+        df_low = pd.DataFrame(
+            low_price_arr.astype(np.float32), columns=all_symbol_list, index=time_arr
+        )
+        df_close = pd.DataFrame(
+            close_price_arr.astype(np.float32), columns=all_symbol_list, index=time_arr
+        )
+        df_amount = pd.DataFrame(
+            amount_arr.astype(np.float32), columns=all_symbol_list, index=time_arr
+        )
+
         self.train(df_vwap, df_open, df_high, df_low, df_close, df_amount)
 
 
